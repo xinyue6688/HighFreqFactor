@@ -271,9 +271,10 @@ class OrderImbalanceStrategy:
             print(f"Testing Method {i+1}: {method_params}")
             print(f"{'='*40}")
             
-            # Generate signals
-            method = method_params.pop('method')
-            self.generate_trading_signals(method=method, **method_params)
+            # Generate signals (make a copy to avoid modifying original)
+            method_params_copy = method_params.copy()
+            method = method_params_copy.pop('method')
+            self.generate_trading_signals(method=method, **method_params_copy)
             
             # Run backtest
             results = self.run_backtest(forward_periods=1, transaction_cost=0.0001)
@@ -282,7 +283,7 @@ class OrderImbalanceStrategy:
             if (results and 'error' not in results and 
                 results['sharpe_ratio'] > best_sharpe):
                 best_sharpe = results['sharpe_ratio']
-                best_method = f"{method} with {method_params}"
+                best_method = f"{method} with {method_params_copy}"
                 best_results = results.copy()
         
         # Use best method for final analysis
@@ -293,7 +294,7 @@ class OrderImbalanceStrategy:
             print(f"{'='*60}")
             
             # Re-run with best method for plotting
-            method_params = methods[0]  # Default to first method for plotting
+            method_params = methods[0].copy()  # Default to first method for plotting
             method = method_params.pop('method')
             self.generate_trading_signals(method=method, **method_params)
             self.run_backtest(forward_periods=1, transaction_cost=0.0001)
