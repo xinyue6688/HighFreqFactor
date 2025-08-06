@@ -242,67 +242,70 @@ class OrderImbalanceStrategy:
         if save_plots:
             plt.savefig('backtest_results.png', dpi=300, bbox_inches='tight')
         plt.show()
-    
+
     def run_comprehensive_analysis(self):
         """Run the complete analysis pipeline"""
-        print("="*60)
+        print("=" * 60)
         print("ORDER IMBALANCE TRADING STRATEGY ANALYSIS")
-        print("="*60)
-        
+        print("=" * 60)
+
         # Load and prepare data
         self.load_and_prepare_data()
-        
+
         # Calculate imbalance metrics
         self.calculate_imbalance_metrics(n_levels=5)
-        
+
         # Test different signal generation methods
         methods = [
             {'method': 'threshold', 'upper_threshold': 0.3, 'lower_threshold': -0.3},
             {'method': 'zscore', 'window': 100, 'threshold': 2},
             {'method': 'percentile', 'window': 100, 'upper_percentile': 80, 'lower_percentile': 20}
         ]
-        
+
         best_sharpe = -np.inf
         best_method = None
         best_results = None
-        
+        best_method_params = None
+
         for i, method_params in enumerate(methods):
-            print(f"\n{'='*40}")
-            print(f"Testing Method {i+1}: {method_params}")
-            print(f"{'='*40}")
-            
-            # Generate signals
-            method = method_params.pop('method')
-            self.generate_trading_signals(method=method, **method_params)
-            
+            print(f"\n{'=' * 40}")
+            print(f"Testing Method {i + 1}: {method_params}")
+            print(f"{'=' * 40}")
+
+            # Create a copy to avoid modifying the original
+            params_copy = method_params.copy()
+            method = params_copy.pop('method')
+            self.generate_trading_signals(method=method, **params_copy)
+
             # Run backtest
             results = self.run_backtest(forward_periods=1, transaction_cost=0.0001)
-            
+
             # Track best performing method
-            if (results and 'error' not in results and 
-                results['sharpe_ratio'] > best_sharpe):
+            if (results and 'error' not in results and
+                    results['sharpe_ratio'] > best_sharpe):
                 best_sharpe = results['sharpe_ratio']
-                best_method = f"{method} with {method_params}"
+                best_method = method
+                best_method_params = method_params.copy()
                 best_results = results.copy()
-        
+
         # Use best method for final analysis
         if best_method:
-            print(f"\n{'='*60}")
-            print(f"BEST PERFORMING METHOD: {best_method}")
+            print(f"\n{'=' * 60}")
+            print(f"BEST PERFORMING METHOD: {best_method} with {best_method_params}")
             print(f"Best Sharpe Ratio: {best_sharpe:.4f}")
-            print(f"{'='*60}")
-            
+            print(f"{'=' * 60}")
+
             # Re-run with best method for plotting
-            method_params = methods[0]  # Default to first method for plotting
-            method = method_params.pop('method')
-            self.generate_trading_signals(method=method, **method_params)
+            best_params_copy = best_method_params.copy()
+            best_params_copy.pop('method')  # Remove method since it's passed separately
+            self.generate_trading_signals(method=best_method, **best_params_copy)
             self.run_backtest(forward_periods=1, transaction_cost=0.0001)
-        
+
         # Create plots
         print("\nGenerating analysis plots...")
         self.plot_imbalance_analysis(save_plots=True)
         self.plot_backtest_results(save_plots=True)
-        
+
         print("\nAnalysis complete! Check the generated plots for detailed results.")
         
 
