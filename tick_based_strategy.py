@@ -13,16 +13,14 @@ class TickBasedOrderImbalanceStrategy:
     Tick-Based Order Imbalance Strategy
     """
 
-    # TODO: 交易参数要改
-    def __init__(self, data_file: str = 'IC2507.csv', 
-                 initial_capital: float = 1000000,  
-                 max_position_size: float = 0.1,    
+    def __init__(self, data_file: str = 'IC2507.csv',
+                 max_lot = 10,
+                 backtest_price = ['midprice', 'counterprice'],
                  stop_loss_pct: float = 0.02,       
                  max_drawdown_pct: float = 0.15):  
         """Initialize imbalanced order strategy"""
+
         self.data_file = data_file
-        self.initial_capital = initial_capital
-        self.max_position_size = max_position_size
         self.stop_loss_pct = stop_loss_pct
         self.max_drawdown_pct = max_drawdown_pct
         self.df = None
@@ -35,18 +33,26 @@ class TickBasedOrderImbalanceStrategy:
         print("Loading and preparing tick data...")
         
         self.df = pd.read_csv(self.data_file)
-        self.df = self.df.sort_values(by=['TradingDay', 'UpdateTime']).reset_index(drop=True)
+        self.df = self.df.drop(columns=['SeqNo', 'SettlementPrice', ]).reset_index(drop=True)
         
         if 'TradingDay' in self.df.columns and 'UpdateTime' in self.df.columns:
-            self.df['timestamp'] = pd.to_datetime(self.df['TradingDay'].astype(str) + ' ' + 
-                                                 self.df['UpdateTime'].astype(str))
-        
+            self.df['timestamp'] = pd.to_datetime(
+                self.df['TradingDay'].astype(str) + ' ' +
+                self.df['UpdateTime'].astype(str)
+            )
+        millisec_clean = pd.to_numeric(self.df['UpdateMillisec'], errors='coerce').fillna(0)
+        millisec_offset = pd.to_timedelta(millisec_clean, unit='ms')
+        self.df['timestamp'] += millisec_offset
+        self.df = self.df.sort_values(by=['timestamp']).reset_index(drop=True)
+
         self.df['mid_price'] = (self.df['BidPrice1'] + self.df['AskPrice1']) / 2
-        
-        self.df['spread'] = self.df['AskPrice1'] - self.df['BidPrice1']
-        self.df['spread_bps'] = (self.df['spread'] / self.df['mid_price']) * 10000
-        
-        self.df['total_volume'] = self.df['BidVolume1'] + self.df['AskVolume1']
+
+        def calculate_return_for_day(group):
+            group = group.copy()
+            rt = group['mid_price'].shift(-1) / group['mid_price'] - 1
+            return rt
+
+        self.df['return'] = self.df.groupby('TradingDay', group_keys=False).apply(calculate_return_for_day)
         
         print(f"Data loaded: {len(self.df)} records")
         print(f"Date range: {self.df['TradingDay'].min()} to {self.df['TradingDay'].max()}")
@@ -57,81 +63,314 @@ class TickBasedOrderImbalanceStrategy:
         """Calculate order imbalance metrics"""
         print("Calculating imbalance metrics...")
 
-        bid_price = self.df['BidPrice1']
-        ask_price = self.df['AskPrice1']
-        bid_volume = self.df['BidVolume1']
-        ask_volume = self.df['AskVolume1']
+        def calculate_imbalance_for_day(group):
+            """Calculate imbalance for a single trading day"""
+            bid_price = group['BidPrice1']
+            ask_price = group['AskPrice1']
+            bid_volume = group['BidVolume1']
+            ask_volume = group['AskVolume1']
 
-        bid_price_prev = bid_price.shift(1)
-        ask_price_prev = ask_price.shift(1)
-        bid_volume_prev = bid_volume.shift(1)
-        ask_volume_prev = ask_volume.shift(1)
+            bid_price_prev = bid_price.shift(1)
+            ask_price_prev = ask_price.shift(1)
+            bid_volume_prev = bid_volume.shift(1)
+            ask_volume_prev = ask_volume.shift(1)
 
-        delta_bid = (
-            (bid_price > bid_price_prev) * bid_volume +
-        (bid_price == bid_price_prev) * (bid_volume - bid_volume_prev)
-        )
+            delta_bid = (
+                (bid_price > bid_price_prev) * bid_volume +
+            (bid_price == bid_price_prev) * (bid_volume - bid_volume_prev)
+            )
 
-        delta_ask = (
-        (ask_price < ask_price_prev) * ask_volume +
-        (ask_price == ask_price_prev) * (ask_volume - ask_volume_prev)
-        )
+            delta_ask = (
+            (ask_price < ask_price_prev) * ask_volume +
+            (ask_price == ask_price_prev) * (ask_volume - ask_volume_prev)
+            )
 
-        self.df['imbalance'] = delta_bid - delta_ask
+            imbalance = delta_bid - delta_ask
 
-        self.df['imbalance_ma_10'] = self.df['imbalance'].rolling(window=10).mean()
-        self.df['imbalance_ma_30'] = self.df['imbalance'].rolling(window=30).mean()
-        
-        self.df['imbalance_volatility'] = self.df['imbalance'].rolling(window=20).std()
-        
+            return imbalance
+
+        print("Grouping by trading day and calculating imbalance...")
+        self.df['imbalance'] = np.nan
+
+        for trading_day in self.df['TradingDay'].unique():
+            day_mask = self.df['TradingDay'] == trading_day
+            day_indices = self.df[day_mask].index
+
+            day_data = self.df.loc[day_mask].copy()
+            day_imbalance = calculate_imbalance_for_day(day_data)
+            self.df.loc[day_indices, 'imbalance'] = day_imbalance
+
         return self.df
 
-    def generate_tick_based_signals(self, 
-                                   imbalance_threshold: float = 0.65,
-                                   min_volume: int = 20,  
-                                   max_spread_bps: float = 15.0,  
-                                ):
-        
-        """Generate signals with tick-based constraints"""
-        print(f"Generating tick-based signals with threshold {imbalance_threshold}...")
-        
-        signals = pd.Series(0, index=self.df.index)
-        
-        volume_filter = self.df['total_volume'] >= min_volume
-        spread_filter = self.df['spread_bps'] <= max_spread_bps
-        
-        
-        for i in range(len(self.df)):
-            if i < 1:  # Skip first tick
-                continue
-            
-            # Volume and spread filters
-            if not (volume_filter.iloc[i] and spread_filter.iloc[i]):
-                continue
-            
-            if self.df['imbalance'].iloc[i] > imbalance_threshold:
-                signals.iloc[i] = 1
-                last_trade_idx = i
-            elif self.df['imbalance'].iloc[i] < -imbalance_threshold:
-                signals.iloc[i] = -1
-                last_trade_idx = i
-        
-        self.signals = signals
-        self.df['signals'] = signals
-        
-        # Calculate signal statistics
-        total_signals = len(signals[signals != 0])
-        buy_signals = len(signals[signals == 1])
-        sell_signals = len(signals[signals == -1])
-        
-        print(f"Signal Statistics:")
-        print(f"  Total Signals: {total_signals}")
-        print(f"  Buy Signals: {buy_signals}")
-        print(f"  Sell Signals: {sell_signals}")
-        print(f"  Signal Frequency: {total_signals/len(signals):.4f}")
-        
-        return signals
-    
+    def calculate_factor_return_corr(self, max_horizon=40, step=2):
+        """
+        Calculate correlations between imbalance factor and future returns
+        at different tick horizons, ensuring calculations stay within trading days
+
+        Parameters:
+        -----------
+        max_horizon : int
+            Maximum number of ticks to look forward
+        step : int
+            Step size for horizon calculation (e.g., step=5 means check every 5 ticks)
+
+        Returns:
+        --------
+        pd.DataFrame: DataFrame with horizons and their corresponding correlations
+        """
+        print(f"Calculating factor-return correlations up to {max_horizon} ticks...")
+
+        if 'imbalance' not in self.df.columns:
+            print("Imbalance not calculated. Running calculate_imbalance_metrics first...")
+            self.calculate_imbalance_metrics()
+
+        def calculate_returns_for_day(day_data, horizon):
+            """Calculate h-tick forward returns within a single trading day"""
+            day_data = day_data.reset_index(drop=True)  # Reset for clean indexing
+
+            current_price = day_data['mid_price']
+            future_price = current_price.shift(-horizon)
+
+            # Calculate log returns (more stable for financial data)
+            returns = np.log(future_price / current_price)
+
+            # Set returns to NaN if we're looking beyond the day's data
+            # This prevents using data from the next day
+            returns.iloc[-horizon:] = np.nan if horizon > 0 else returns.iloc[-horizon:]
+
+            return returns
+
+        correlations = []
+        horizons = range(1, max_horizon + 1, step)
+
+        print("Calculating returns and correlations for each horizon...")
+
+        for h in horizons:
+            print(f"Processing horizon {h} ticks...", end='\r')
+
+            # Initialize lists to collect imbalance and return values across all days
+            all_imbalance_values = []
+            all_return_values = []
+
+            # Process each trading day separately
+            for trading_day in self.df['TradingDay'].unique():
+                day_mask = self.df['TradingDay'] == trading_day
+                day_data = self.df[day_mask].copy()
+
+                if len(day_data) <= h:  # Skip days with insufficient data
+                    continue
+
+                # Calculate returns for this day
+                day_returns = calculate_returns_for_day(day_data, h)
+
+                # Get imbalance values for this day
+                day_imbalance = day_data['imbalance'].reset_index(drop=True)
+
+                # Collect valid (non-NaN) pairs
+                valid_mask = ~(day_imbalance.isna() | day_returns.isna())
+
+                if valid_mask.sum() > 5:  # Need at least 5 valid observations per day
+                    all_imbalance_values.extend(day_imbalance[valid_mask].values)
+                    all_return_values.extend(day_returns[valid_mask].values)
+
+            # Calculate correlation across all valid observations
+            if len(all_imbalance_values) > 10:  # Need sufficient total observations
+                corr = np.corrcoef(all_imbalance_values, all_return_values)[0, 1]
+
+                correlations.append({
+                    'horizon_ticks': h,
+                    'correlation': corr,
+                    'valid_observations': len(all_imbalance_values),
+                    'trading_days_used': len([day for day in self.df['TradingDay'].unique()
+                                              if (self.df['TradingDay'] == day).sum() > h])
+                })
+
+        print()
+
+        # Create results DataFrame
+        corr_results = pd.DataFrame(correlations)
+
+        # Find optimal horizons
+        if len(corr_results) > 0:
+            best_corr = corr_results.loc[corr_results['correlation'].idxmax()]
+            lowest_corr = corr_results.loc[corr_results['correlation'].idxmin()]
+
+            print(f"\nCorrelation Analysis Results:")
+            print(
+                f"Highest correlation: {best_corr['correlation']:.4f} at {best_corr['horizon_ticks']} ticks")
+            print(
+                f"  ({best_corr['valid_observations']} observations from {best_corr['trading_days_used']} days)")
+            print(
+                f"Lowest correlation: {lowest_corr['correlation']:.4f} at {lowest_corr['horizon_ticks']} ticks")
+            print(
+                f"  ({lowest_corr['valid_observations']} observations from {lowest_corr['trading_days_used']} days)")
+
+        # Store results for later use
+        self.correlation_analysis = corr_results
+
+        return corr_results
+
+    def analyze_imbalance_buckets(self, num_buckets=10):
+        df = self.df.copy()
+        df = df.dropna(subset=['imbalance', 'return'])
+        df['imbalance_bucket'] = pd.qcut(df['imbalance'], q=num_buckets, labels=False, duplicates='drop')
+        bucket_returns = df.groupby('imbalance_bucket').agg(
+            avg_return = ('return', 'mean'),
+            imbalance_avg = ('imbalance', 'mean')
+        ).reset_index()
+
+        self.bucket_returns = bucket_returns
+
+        df = self.bucket_returns.copy()
+        df['avg_return_bps'] = df['avg_return'] * 10000  # Convert to basis points
+
+        plt.figure(figsize=(8, 5))
+        plt.bar(
+            df['imbalance_bucket'],
+            df['avg_return_bps'],
+            width=0.6,
+            color='skyblue',
+            edgecolor='black'
+        )
+
+        plt.xlabel('Imbalance Bucket', fontsize=12)
+        plt.ylabel('Average Return (bps)', fontsize=12)
+        plt.title('Average Return by Imbalance Bucket', fontsize=14)
+        plt.xticks(df['imbalance_bucket'], fontsize=10)
+        plt.yticks(fontsize=10)
+        plt.tight_layout()
+        plt.show()
+
+        return bucket_returns
+
+    def generate_signals(self):
+        print("Generating tick-based signals using rolling 120-tick window...")
+
+        df = self.df.copy()
+        df['signal'] = 0
+        window = 120
+
+        for day in df['TradingDay'].unique():
+            day_mask = df['TradingDay'] == day
+            day_df = df.loc[day_mask].copy()
+
+            imbalances = day_df['imbalance']
+
+            # Rolling percentiles
+            q25 = imbalances.rolling(window=window, min_periods=window).quantile(0.25)
+            q75 = imbalances.rolling(window=window, min_periods=window).quantile(0.75)
+
+            signal = pd.Series(0, index=day_df.index)
+            signal[imbalances > q75] = 1
+            signal[imbalances < q25] = -1
+
+            df.loc[day_mask, 'signal'] = signal
+
+        self.df = df
+
+        print("Signal generation complete.")
+        print(df['signal'].value_counts().to_dict())
+        return df
+
+    def run_trade_execution(self, max_lot=10, stop_loss_pct=0.02, transaction_cost_bps=2):
+        print("Running execution logic with transaction costs...")
+
+        df = self.df.copy()
+        df['position'] = 0
+        df['trade_lot'] = 0
+        df['entry_price'] = np.nan
+        df['pnl'] = 0.0
+        df['cumulative_pnl'] = 0.0
+
+        cumulative_pnl = 0.0
+        cost_rate = transaction_cost_bps / 10000  # convert bps to decimal
+
+        for day in df['TradingDay'].unique():
+            day_mask = df['TradingDay'] == day
+            day_df = df.loc[day_mask].copy()
+            indices = day_df.index
+
+            current_position = 0
+            entry_price = None
+
+            for i in indices:
+                signal = df.at[i, 'signal']
+                imbalance = df.at[i, 'imbalance']
+
+                # Open position
+                if current_position == 0 and signal != 0 and i >= 120:
+                    window = df.loc[i - 120:i - 1, 'imbalance']
+                    mean = window.mean()
+                    std = window.std()
+                    if std > 0:
+                        z = (imbalance - mean) / std
+                        lot = int(round(np.clip(abs(z) / 3 * max_lot, 0, max_lot)))
+
+                        if lot > 0:
+                            current_position = signal * lot
+                            entry_price = df.at[i, 'AskPrice1'] if current_position > 0 else df.at[i, 'BidPrice1']
+
+                            # Apply entry cost
+                            entry_cost = abs(current_position) * entry_price * cost_rate
+                            cumulative_pnl -= entry_cost
+
+                            df.at[i, 'trade_lot'] = current_position
+                            df.at[i, 'entry_price'] = entry_price
+
+                # Manage position
+                elif current_position != 0:
+                    current_price = df.at[i, 'BidPrice1'] if current_position > 0 else df.at[i, 'AskPrice1']
+                    return_pct = (current_price - entry_price) / entry_price * np.sign(current_position)
+
+                    # Exit condition
+                    if (signal * current_position < 0) or (return_pct < -stop_loss_pct):
+                        pnl = return_pct * abs(current_position)
+                        exit_cost = abs(current_position) * current_price * cost_rate
+                        pnl -= exit_cost  # subtract transaction cost
+
+                        cumulative_pnl += pnl
+                        df.at[i, 'pnl'] = pnl
+                        df.at[i, 'trade_lot'] = -current_position
+                        current_position = 0
+                        entry_price = None
+                    else:
+                        df.at[i, 'position'] = current_position
+
+                df.at[i, 'cumulative_pnl'] = cumulative_pnl
+
+            # End-of-day force close
+            if current_position != 0:
+                last_idx = indices[-1]
+                close_price = df.at[last_idx, 'BidPrice1'] if current_position > 0 else df.at[last_idx, 'AskPrice1']
+                return_pct = (close_price - entry_price) / entry_price * np.sign(current_position)
+                pnl = return_pct * abs(current_position)
+                exit_cost = abs(current_position) * close_price * cost_rate
+                pnl -= exit_cost
+
+                cumulative_pnl += pnl
+
+                df.at[last_idx, 'pnl'] = pnl
+                df.at[last_idx, 'trade_lot'] = -current_position
+                df.at[last_idx, 'position'] = 0
+                df.at[last_idx, 'cumulative_pnl'] = cumulative_pnl
+
+                current_position = 0
+                entry_price = None
+
+        self.df = df
+        print(f"Execution complete. Final Cumulative PnL: {cumulative_pnl:.2f}")
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(df['timestamp'], df['cumulative_pnl'], label='Cumulative PnL', linewidth=1.5)
+        plt.xlabel('Time')
+        plt.ylabel('Cumulative PnL')
+        plt.title('Cumulative PnL Over Time')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        return df
+
     def run_tick_based_backtest(self, transaction_cost: float = 0.0001):
         """Run backtest with tick-based position sizing and risk management"""
         print("Running tick-based backtest...")
@@ -430,16 +669,18 @@ class TickBasedOrderImbalanceStrategy:
         
         # Calculate imbalance metrics
         self.calculate_imbalance_metrics()
-        
+
+        # Calculate correlations between imbalance metrics and returns
+        # self.calculate_factor_return_corr()
+
+        # Imbalance buckets and returns
+        self.analyze_imbalance_buckets()
+
         # Generate signals with tick-based parameters
-        self.generate_tick_based_signals(
-            imbalance_threshold=0.65,
-            min_volume=20,
-            max_spread_bps=15.0,
-        )
+        self.generate_signals()
         
-        # Run tick-based backtest
-        self.run_tick_based_backtest(transaction_cost=0.0001)
+
+        self.run_trade_execution()
         
         # Create plots
         print("\nGenerating tick-based analysis plots...")
@@ -454,8 +695,6 @@ if __name__ == "__main__":
     # Create tick-based strategy instance
     strategy = TickBasedOrderImbalanceStrategy(
         data_file='IC2507.csv',
-        initial_capital=1000000,  # $1M initial capital
-        max_position_size=0.1,    # Max 10% per trade
         stop_loss_pct=0.02,       # 2% stop loss
         max_drawdown_pct=0.15     # 15% max drawdown
     )
